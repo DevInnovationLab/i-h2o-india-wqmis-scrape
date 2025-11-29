@@ -2,6 +2,9 @@ import pandas as pd
 import os
 import numpy as np
 from scipy.interpolate import interp1d
+import geopandas as gpd
+import folium
+from branca.colormap import LinearColormap
 
 folder_path = '/Users/admin/Library/CloudStorage/Box-Box/India WQMIS Data/Format L2/Processed Databases'
 intermediate_path = '/Users/admin/Library/CloudStorage/Box-Box/India WQMIS Data/Format L2/Intermediate for WQI'
@@ -66,44 +69,161 @@ def ecoli_subindex(x):
     result[in_range] = interp_func(x[in_range])
 
     return result
-
-def make_wqi():
+def make_wqi_with_geometry():
+    # Load geojsons
+    shapefile_path = '/Users/admin/Library/CloudStorage/Box-Box/India WQMIS Data/Shapefiles'
+    gdf1 = gpd.read_file(os.path.join(shapefile_path,'mh1.geojson'))
+    gdf2 = gpd.read_file(os.path.join(shapefile_path,'mh2.geojson'))
+    gdf = pd.concat([gdf1, gdf2], ignore_index=True)
+    
+    # Normalize for matching
+    gdf['district_norm'] = gdf['DISTRICT'].str.strip().str.upper()
+    gdf['village_norm'] = gdf['NAME'].str.strip().str.upper()
+    
+    # Process WQI data
     pqs = [f for f in os.listdir(intermediate_path) if f.endswith('.parquet')]
+    all_data = []
+    
     for pq in pqs:
-        df = pd.read_parquet(os.path.join(intermediate_path,pq))
-        
-        # Apply to create a new column
+        df = pd.read_parquet(os.path.join(intermediate_path, pq))
         df['QuarterStart'] = df['Sample tested date'].apply(get_quarter_start)
 
-        # Replace -1.0 with NaN so they are excluded from the mean
         df_clean = df.copy()
-        for col in ['Fluoride', 'Nitrate', 'EColi']:
-            df_clean[col] = df_clean[col].replace(-1.0, np.nan)
+        for col in ['Fluoride', 'EColi']:
+            df_clean.loc[df_clean[col] == -1.0, col] = np.nan
 
-        # Group by quarter and calculate the mean
-        agg_df = df_clean.groupby(['District','Village','QuarterStart'])[['Fluoride', 'Nitrate', 'EColi']].max().reset_index().fillna(-1)
-
-        # Make subindices
-        agg_df['Fluoride_Subindex'] = fluoride_subindex(agg_df['Fluoride'])
-        agg_df['EColi_Subindex'] = ecoli_subindex(agg_df['EColi'])
-
-        # Drop if EColi is 0 
-        filtered_df = agg_df[agg_df['EColi_Subindex'] > 0].copy()
-
-        # Step 1: Compute the max subindex per row
-        filtered_df['WQI'] = filtered_df[['EColi_Subindex', 'Fluoride_Subindex']].max(axis=1)
-
-        # Step 2: Identify the max subindex *within each group*
-        filtered_df['Group_Key'] = filtered_df[['State (2024-2025)','District', 'Village', 'QuarterStart']].astype(str).agg('|'.join, axis=1)
-        max_per_group = filtered_df.groupby('Group_Key')['WQI'].transform('max')
-
-        # Step 3: Filter rows where the row-level Max_Subindex equals the group max
-        filtered_df = filtered_df[filtered_df['WQI'] == max_per_group].copy()
-
-        # (Optional) Drop the helper Group_Key column
-        filtered_df.drop(columns='Group_Key', inplace=True)
+        # Group by quarter: max contaminant per village-quarter
+        agg_df = df_clean.groupby(['State (2024-2025)','District','Village','QuarterStart'])[['Fluoride', 'EColi']].max().reset_index()
         
-        print(filtered_df.tail(100))
+        # Require both measurements
+        agg_df = agg_df[agg_df['Fluoride'].notna() & agg_df['EColi'].notna()].copy()
 
-get_clean_save()
-make_wqi()
+        # Compute subindices
+        agg_df['Fluoride_Subindex'] = fluoride_subindex(agg_df['Fluoride'].values)
+        agg_df['EColi_Subindex'] = ecoli_subindex(agg_df['EColi'].values)
+        
+        agg_df['WQI'] = agg_df[['Fluoride_Subindex', 'EColi_Subindex']].max(axis=1)
+        
+        all_data.append(agg_df)
+    
+    combined = pd.concat(all_data, ignore_index=True)
+    
+    # Aggregate to village level: max WQI and corresponding values
+    village_wqi = combined.loc[combined.groupby(['State (2024-2025)','District','Village'])['WQI'].idxmax()]
+    village_wqi = village_wqi[['State (2024-2025)','District','Village','WQI','Fluoride','Fluoride_Subindex','EColi','EColi_Subindex']].reset_index(drop=True)
+    
+    # Normalize for matching
+    village_wqi['district_norm'] = village_wqi['District'].str.strip().str.upper()
+    village_wqi['village_norm'] = village_wqi['Village'].str.strip().str.upper()
+    
+    # Merge
+    merged = gdf.merge(
+        village_wqi,
+        on=['district_norm', 'village_norm'],
+        how='left'
+    )
+    
+    print(f"Total villages in geojson: {len(gdf)}")
+    print(f"Villages with WQI data: {merged['WQI'].notna().sum()}")
+    print(f"Match rate: {merged['WQI'].notna().sum() / len(gdf) * 100:.1f}%")
+    
+    merged.to_file('intermediate_shapefiles/maharashtra_wqi.geojson', driver='GeoJSON')
+    return merged
+def create_wqi_map(gdf_wqi, simplify=False, filename='wqi_map.html'):
+    gdf_with_data = gdf_wqi[gdf_wqi['WQI'].notna()].copy()
+    
+    # Simplify geometries if requested
+    if simplify:
+        gdf_with_data['geometry'] = gdf_with_data['geometry'].simplify(tolerance=0.001)
+    
+    colormap = LinearColormap(
+        colors=['green', 'yellow', 'orange', 'red'],
+        vmin=0,
+        vmax=100,
+        caption='Water Quality Index (WQI)'
+    )
+    
+    m = folium.Map(
+        location=[19.7515, 75.7139],
+        zoom_start=7,
+        tiles='CartoDB positron'
+    )
+    
+    # Create feature groups for filtering
+    all_villages = folium.FeatureGroup(name='All Villages (WQI ≥ 0)', show=True)
+    wqi_positive = folium.FeatureGroup(name='WQI > 0 only', show=False)
+    ecoli_positive = folium.FeatureGroup(name='E.coli > 0 only', show=False)
+    
+    for idx, row in gdf_with_data.iterrows():
+        geojson_obj = folium.GeoJson(
+            row['geometry'],
+            style_function=lambda x, wqi=row['WQI']: {
+                'fillColor': colormap(wqi),
+                'color': 'black',
+                'weight': 0.5,
+                'fillOpacity': 0.7
+            },
+            tooltip=folium.Tooltip(
+                f"<b>{row['NAME']}</b><br>"
+                f"District: {row['DISTRICT']}<br>"
+                f"<b>WQI: {row['WQI']:.1f}</b><br><br>"
+                f"Fluoride: {row['Fluoride']:.2f} mg/L (Subindex: {row['Fluoride_Subindex']:.1f})<br>"
+                f"E.coli: {row['EColi']:.1f} CFU/100mL (Subindex: {row['EColi_Subindex']:.1f})"
+            )
+        )
+        
+        geojson_obj.add_to(all_villages)
+        
+        if row['WQI'] > 0:
+            folium.GeoJson(
+                row['geometry'],
+                style_function=lambda x, wqi=row['WQI']: {
+                    'fillColor': colormap(wqi),
+                    'color': 'black',
+                    'weight': 0.5,
+                    'fillOpacity': 0.7
+                },
+                tooltip=folium.Tooltip(
+                    f"<b>{row['NAME']}</b><br>"
+                    f"District: {row['DISTRICT']}<br>"
+                    f"<b>WQI: {row['WQI']:.1f}</b><br><br>"
+                    f"Fluoride: {row['Fluoride']:.2f} mg/L (Subindex: {row['Fluoride_Subindex']:.1f})<br>"
+                    f"E.coli: {row['EColi']:.1f} CFU/100mL (Subindex: {row['EColi_Subindex']:.1f})"
+                )
+            ).add_to(wqi_positive)
+        
+        if row['EColi'] > 0:
+            folium.GeoJson(
+                row['geometry'],
+                style_function=lambda x, wqi=row['WQI']: {
+                    'fillColor': colormap(wqi),
+                    'color': 'black',
+                    'weight': 0.5,
+                    'fillOpacity': 0.7
+                },
+                tooltip=folium.Tooltip(
+                    f"<b>{row['NAME']}</b><br>"
+                    f"District: {row['DISTRICT']}<br>"
+                    f"<b>WQI: {row['WQI']:.1f}</b><br><br>"
+                    f"Fluoride: {row['Fluoride']:.2f} mg/L (Subindex: {row['Fluoride_Subindex']:.1f})<br>"
+                    f"E.coli: {row['EColi']:.1f} CFU/100mL (Subindex: {row['EColi_Subindex']:.1f})"
+                )
+            ).add_to(ecoli_positive)
+    
+    all_villages.add_to(m)
+    wqi_positive.add_to(m)
+    ecoli_positive.add_to(m)
+    
+    folium.LayerControl().add_to(m)
+    colormap.add_to(m)
+    
+    m.save(filename)
+    print(f"Map saved to {filename} with {len(gdf_with_data)} villages")
+    print(f"Villages with WQI > 0: {(gdf_with_data['WQI'] > 0).sum()}")
+    print(f"Villages with E.coli > 0: {(gdf_with_data['EColi'] > 0).sum()}")
+    return m
+
+# Create both versions
+gdf_wqi = make_wqi_with_geometry()
+map_complex = create_wqi_map(gdf_wqi, simplify=False, filename='maps/Maharashtra_wqi_map_detailed.html')
+map_simple = create_wqi_map(gdf_wqi, simplify=True, filename='maps/Maharashtra_wqi_map_simplified.html')

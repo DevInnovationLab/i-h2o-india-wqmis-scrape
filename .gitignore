@@ -1,0 +1,4 @@
+Maharashtra_wqi_map_detailed.html
+*.parquet
+*.geojson
+.DS_Store
