@@ -1,13 +1,13 @@
 # This script was written to scrape the ejalshakti website. WIP.
-
+import re
+import time
 import asyncio # For doing multiple processes at once (useful for opening many scheme links at once)
-import random # Will be used for defining our human sleep function
 from playwright.async_api import async_playwright # Our main engine!
 
 # Define our website
 URL = "https://ejalshakti.gov.in/JJM/JJMReports/profiles/rpt_VillageProfile.aspx"
 
-# Define our CSS Selectors so it has self-explanatory names
+# Define our HTML Selectors so it has self-explanatory names
 SELECTORS = {
     "state": "#CPHPage_ddState",
     "district": "#ddDistrict",
@@ -22,11 +22,6 @@ SELECTORS = {
 
 # --- HELPER FUNCTION --- 
 
-# Pause Function (we add variability to our clicks to "hopefully" avoid being detected as a bot)
-async def human_sleep(min_s=0.2, max_s=0.6):
-    delay = random.uniform(min_s, max_s)
-    await asyncio.sleep(delay)
-
 # Selector Function (this function is used to navigate the website)
 async def select_and_wait(page, selector_id, option_label):
     # We wait for a complete POST response
@@ -39,49 +34,88 @@ async def select_and_wait(page, selector_id, option_label):
     # We wait for 120 seconds until the spinning gif on the page disappears
         await page.wait_for_load_state("domcontentloaded", timeout=120000)
     except Exception as e:
-        print("❌ The page is still loading, but it took longer than 10 seconds so we must proceed:", e)
-    # Add small variability to speed
-    await human_sleep()
+        print("❌ The page is still loading, but it took longer than 120 seconds so we must proceed:", e)
 
 # Options Scraper Function (scrapes the state names, district names, panchayat names, etc)
 async def get_options(page, selector_id):
     # Tries to get the dropdown menu
-        try:
-            await page.wait_for_selector(selector_id, state="attached", timeout=10000)
-            try:
-                await page.wait_for_function(f"document.querySelector('{selector_id}').options.length > 1", timeout=10000)
-            except:
-                pass
-        
-            # Scrapes and cleans them
-            options = await page.locator(f"{selector_id} option").all_text_contents()
-            cleaned_options = [o.strip() for o in options if "Select" not in o and o.strip() != ""]
-            return cleaned_options
-        except Exception as e:
-            print("❌ get_options error:", e)
-            return []
+    try:
+        await page.wait_for_selector(selector_id, state="attached", timeout=60000)
+        # Javascript code that basically ensures the dropdown exists, and we have an option that does not have the word select (it takes time to populate the list)
+        await page.wait_for_function(
+            f"""() => {{
+                const el = document.querySelector('{selector_id}');
+                return el && Array.from(el.options).some(o => !o.text.includes('Select') && o.text.trim() !== '');
+            }}""",
+            timeout=60000
+        )
+        # Scrapes and cleans them
+        options = await page.locator(f"{selector_id} option").all_text_contents()
+        cleaned_options = [o.strip() for o in options if "Select" not in o and o.strip() != ""]
+        return cleaned_options
+    except Exception as e:
+        print("❌ get_options error:", e)
+        return []
 
 # Parallel Scheme Extractor Function (this function handles one tab and we will run many of these at once)
 async def scrape_single_scheme(context, url, semaphore):
     async with semaphore:
-        page = await context.new_page()
         cost = "N/A"
         try:
-            await page.goto(url, timeout=60000) # Give it 60s to load
-            el = page.locator("#CPHPage_lblEstimatedCost") # Currently this function only scrapes the scheme cost, but we could add more!
-            if await el.count() > 0:
-                cost = await el.inner_text()
-                # Use this to test if it's correctly scraping the scheme cost
-                print(f"             Scheme cost: {cost}")
-        except:
+            # We request the raw HTML code instead of opening a tab
+            # This shares cookies with the main browser window, so the session persists
+            response = await context.request.get(url, timeout=60000)
+            
+            if response.ok:
+                body = await response.text()
+                
+                # We use a simple regex to find the number inside the specific HTML tag (BeautifulSoup is more robust, but re is simpler as the website is static)
+                # Remember that we can add more stuff! This is just to test if it works
+                # Looks for: <span id="CPHPage_lblEstimatedCost">123.45</span>
+                match = re.search(r'id="CPHPage_lblEstimatedCost"[^>]*>(.*?)</span>', body)
+                
+                if match:
+                    cost = match.group(1)
+                    print(f"             Scheme cost: {cost}")
+            else:
+                print(f"             ❌ Server returned status {response.status}")
+                
+        except Exception as e:
             cost = "Error"
-            print("             ❌ Couldn't calculate cost!")
+            print(f"             ❌ Request failed: {e}")
         
-        await page.close()
         return cost
 
+# Village Recovery function (if the reset/show button fails we attempt a full reload and reselect)
+async def full_recovery(page, current_state, current_district, current_block, current_panchayat):
+    print("             ❌ Attempting page reload for recovery...")
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=120000) # A regular reload
+        print("             🔄 Page reloaded successfully.")
+        return
+    except Exception as e:
+        print("             ❌ Simple reload failed, attempting full recovery:", e) # We visit the site from scratch and attempt to go to the next village
+        try:
+            for attempt in range(3):
+                try:
+                    await page.goto(URL, timeout=120000)
+                    break
+                except Exception as _:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1)
+
+            await select_and_wait(page, SELECTORS["state"], current_state)
+            await select_and_wait(page, SELECTORS["district"], current_district)
+            await select_and_wait(page, SELECTORS["block"], current_block)
+            await select_and_wait(page, SELECTORS["panchayat"], current_panchayat)
+            print("             🔄 Full recovery successful.")
+        except Exception as e2:
+            print("             ❌ Full recovery failed. Something is terribly wrong! Stopping script to prevent incorrect scraping:", e2)
+            raise SystemExit(1)
+
 # Village Processor Function (this is the main workhorse as this function processes the villages)
-async def process_village(context, page, village_name):
+async def process_village(context, page, village_name, current_state, current_district, current_block, current_panchayat):
 
     # 1. We click the show button
     try:
@@ -92,7 +126,8 @@ async def process_village(context, page, village_name):
         except Exception as e:
             print("             ❌ DOM load wait failed, continuing anyway:", e)
     except Exception as e:
-        print(f"             ❌ Show click failed for {village_name}:", e)
+        print(f"             ❌ Show click failed for {village_name}, attempting recovery:", e)
+        await full_recovery(page, current_state, current_district, current_block, current_panchayat)
         return
     
     # 2. Scrape Basic Village Info
@@ -108,8 +143,13 @@ async def process_village(context, page, village_name):
         await page.locator(SELECTORS["scheme_links"]).first.wait_for(state="attached", timeout=5000)
     except:
         print("             No scheme links appeared after 5 seconds")
-        await page.click(SELECTORS["reset_btn"])
-        await page.wait_for_selector(SELECTORS["show_btn"], state="attached")
+        # We select the next village
+        try:
+            await page.wait_for_selector(SELECTORS["reset_btn"], state="attached", timeout=60000)
+            await page.click(SELECTORS["reset_btn"])
+            await page.wait_for_selector(SELECTORS["show_btn"], state="attached", timeout=60000)
+        except:
+            await full_recovery(page, current_state, current_district, current_block, current_panchayat)
         return
 
     links = await page.locator(SELECTORS["scheme_links"]).all()
@@ -128,30 +168,46 @@ async def process_village(context, page, village_name):
             tasks.append(scrape_single_scheme(context, full_url, semaphore))
     
     if tasks:
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         print(f"             ✅ Scraped {len(results)} scheme(s)")
     
-    # We close our current village here
+    # Reset to prepare for next village
     try:
+        await page.wait_for_selector(SELECTORS["reset_btn"], state="attached", timeout=60000)
         await page.click(SELECTORS["reset_btn"])
-        await page.wait_for_selector(SELECTORS["show_btn"], state="attached", timeout = 10000)
-    except Exception as e:
-        print("             ❌ RESET FAILED. PLEASE RERUN THE CODE:", e)
-        raise SystemExit(1)
+        await page.wait_for_selector(SELECTORS["show_btn"], state="attached", timeout=60000)
+    except:
+        await full_recovery(page, current_state, current_district, current_block, current_panchayat)
+        return
 
 # --- MAIN FUNCTION --- 
 async def main():
+    start_time = None
+    processed = 0
+    # Track where we are in the hierarchy (useful for when the website crashes and we perform a complete reload)
+    current_state = None
+    current_district = None
+    current_block = None
+    current_panchayat = None
+    current_village = None
     # Start Playwright
     async with async_playwright() as p:
         # Launch Browser and open tab
         browser = await p.chromium.launch(headless=True) # Change to headless=False if you want to see the actual Chromium browser
         context = await browser.new_context()
         page = await context.new_page()
-        try:
-            await page.goto(URL, timeout=60000)
-            print("Page loaded!")
-        except Exception as e:
-            print("❌ Page failed to load, please try again:", e)
+        print("Connecting...")
+        for attempt in range(3):
+            try:
+                await page.goto(URL, timeout=120000)
+                print("Page loaded!")
+                break
+            except Exception as e:
+                print(f"❌ Page load failed (attempt {attempt+1}/3):", e)
+                await asyncio.sleep(1)
+
+        else:
+            print("❌ Page failed to load after 3 attempts. Please retry later.")
             await browser.close()
             return
 
@@ -161,6 +217,7 @@ async def main():
         # 2. Loop Through States. If you want to test a certain state/district/block, you can, for example, do state[1:2] which will check the 2nd state on the dropdown.
         # Pro tip: Kerala (15th states) is a good state to test because the villages have so many schemes.
         for state in states:
+            current_state = state
             print(f"[STATE] {state}")
             await select_and_wait(page, SELECTORS["state"], state)
 
@@ -169,6 +226,7 @@ async def main():
 
             # 4. Loop Through Districts
             for district in districts:
+                current_district = district
                 print(f"  └─ [DISTRICT] {district}")
                 await select_and_wait(page, SELECTORS["district"], district)
 
@@ -177,6 +235,7 @@ async def main():
 
                 # 6. Loop Through blocks
                 for block in blocks:
+                    current_block = block
                     print(f"     └─ [BLOCK] {block}")
                     await select_and_wait(page, SELECTORS["block"], block)
 
@@ -185,17 +244,25 @@ async def main():
 
                     # 8. Loop Through Panchayats
                     for pan in panchayats:
+                        current_panchayat = pan
                         print(f"        └─ [PANCHAYAT] {pan}")
                         await select_and_wait(page, SELECTORS["panchayat"], pan)
 
                         # 9. LEVEL 5: VILLAGE
                         villages = await get_options(page, SELECTORS["village"])
 
-                        # 10. Loop Through Villages
+                        # 10. Loop Through Villages with a timer
                         for vil in villages:
+                            current_village = vil
                             print(f"            └─ [VILLAGE] {vil}")
                             await select_and_wait(page, SELECTORS["village"], vil)
-                            await process_village(context, page, vil)
+                            if start_time is None:
+                                start_time = time.time()   # start timing from first village only
+                            await process_village(context, page, vil, current_state, current_district, current_block, current_panchayat)
+                            processed += 1
+                            elapsed = time.time() - start_time
+                            avg = elapsed / processed
+                            print(f"             ⏱️ Processed {processed} villages | Avg {avg:.2f}s each | Elapsed {elapsed/60:.2f} min")
 
         await browser.close()
 
