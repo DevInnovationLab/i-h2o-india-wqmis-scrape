@@ -1,5 +1,4 @@
 # Setup
-## This script is still incomplete and is still used for testing purposes.
 
 1. Create and activate a virtual environment
 
@@ -8,8 +7,8 @@
    source .venv/bin/activate
    
    FOR WINDOWS
-   python3.9 -m venv .venv
-   source venv\Scripts\activate
+   python -m venv .venv
+   .venv\Scripts\activate
 
 2. Install Python dependencies
 
