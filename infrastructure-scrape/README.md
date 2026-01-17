@@ -3,13 +3,18 @@
 
 1. Create and activate a virtual environment
 
+   FOR MACOS/LINUX
    python3.9 -m venv .venv
    source .venv/bin/activate
+   
+   FOR WINDOWS
+   python3.9 -m venv .venv
+   source venv\Scripts\activate
 
 2. Install Python dependencies
 
    pip install -r requirements.txt
 
-3. Install Playwright browsers (we use Chromium)
+3. Run 0_preliminary.py script first to get the tasks list
 
-   playwright install chromium
+4. Run 1_scraper.py to scrape
