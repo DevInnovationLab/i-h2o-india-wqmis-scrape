@@ -12,8 +12,9 @@ from pebble import ProcessPool
 URL = "https://ejalshakti.gov.in/JJM/JJMReports/profiles/rpt_VillageProfile.aspx"
 DOMAIN = "https://ejalshakti.gov.in/JJM/"
 DB_NAME = "jjm_parallel_data.db"
-NUM_SCRAPER_PROCESSES = 10 # Adjust this amount if you want to increase/decrease the workers/scrapers
+NUM_SCRAPER_PROCESSES = 15 # Adjust this amount if you want to increase/decrease the workers/scrapers
 BATCH_SIZE = 100 # The scrapers work in batch to organize what the workers can work on. Keep this high so that the workers could keep working because sometimes there's a "struggler" worker.
+COOLDOWN_PERIOD = 300 # Adjust this amount if you want to edit the cooldown. Five minutes seem to be sufficient to circumvent a soft IP Block.
 
 # --- PARSING HELPERS ---
 # These are just functions that we use to grab the texts and format them
@@ -258,6 +259,18 @@ class ScraperWorker:
             
         except Exception as e:
             print(f"❌ Error on Block {block_val}: {e}")
+            if "Read timed out" in str(e):
+                with failure_counter.get_lock():
+                    failure_counter.value += 1
+                    current_fails = failure_counter.value
+
+                if current_fails >= 3:
+                # Every worker that sees current_fails >= 3 will sleep
+                    print(f"🛑 Failures: {current_fails}. Sleeping for a while...")
+                    time.sleep(COOLDOWN_PERIOD) 
+        
+                    with failure_counter.get_lock():
+                        failure_counter.value = 0
 
 # --- DB WRITER ---
 # This function runs as a background "Listener" thread in Python. 
@@ -369,11 +382,13 @@ def init_db():
 # --- MULTIPROCESSING HELPERS ---
 
 # Function to start a worker
-def init_worker_process(q, cache):
+def init_worker_process(q, cache, f_count):
     global write_queue
     write_queue = q
     global shared_scheme_cache
     shared_scheme_cache = cache
+    global failure_counter
+    failure_counter = f_count
 
 # A wrapper function to run the worker class inside a process
 def run_scraper_task(task):
@@ -395,46 +410,51 @@ def main():
     manager = multiprocessing.Manager()
     write_queue = manager.Queue()
     shared_scheme_cache = manager.list(existing_schemes) # Shared list
+    failure_counter = manager.Value('i', 0) # Failure counter for sleeping if we get too many failures
 
     # 2. Start DB Writer (Runs in a Thread in the Main Process)
     writer_thread = threading.Thread(target=db_writer_listener, daemon=True)
     writer_thread.start()
 
-    while True:
-        # 3. Grab Batch
-        conn = sqlite3.connect(DB_NAME, timeout=30)
-        tasks = conn.execute(f"SELECT DISTINCT state_val, dist_val, block_val FROM queue WHERE status = 'PENDING' LIMIT {BATCH_SIZE}").fetchall()
-        conn.close()
+    try:
+        while True:
+            # 3. Grab Batch
+            conn = sqlite3.connect(DB_NAME, timeout=30)
+            tasks = conn.execute(f"SELECT DISTINCT state_val, dist_val, block_val FROM queue WHERE status = 'PENDING' LIMIT {BATCH_SIZE}").fetchall()
+            conn.close()
 
-        if not tasks:
-            print("💤 No pending tasks, closing in 30 seconds...")
-            time.sleep(30); continue
+            if not tasks:
+                print("💤 No pending tasks, closing in 30 seconds...")
+                time.sleep(30); continue
 
-        print(f"⚡️ Batch Start: Dispatching {len(tasks)} tasks...")
+            print(f"⚡️ Batch Start: Dispatching {len(tasks)} tasks...")
 
-        # 4. We pass the shared queue to every new process via 'initializer'
-        with ProcessPool(max_workers=NUM_SCRAPER_PROCESSES, initializer=init_worker_process, initargs=(write_queue, shared_scheme_cache)) as pool:
+            # 4. We pass the shared queue to every new process via 'initializer'
+            with ProcessPool(max_workers=NUM_SCRAPER_PROCESSES, initializer=init_worker_process, initargs=(write_queue, shared_scheme_cache, failure_counter)) as pool:
             
-            # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 10 minutes because some blocks are quite large but we don't wanna take too long. We can always scrape the left out blocks later because we record the progress at the panchayat level
-            future = pool.map(run_scraper_task, tasks, timeout=600)
+                # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 10 minutes because some blocks are quite large but we don't wanna take too long. We can always scrape the left out blocks later because we record the progress at the panchayat level
+                future = pool.map(run_scraper_task, tasks, timeout=3600)
             
-            iterator = future.result()
+                iterator = future.result()
             
-            while True:
-                try:
-                    next(iterator)
-                except StopIteration:
-                    break # Batch finished
-                except TimeoutError:
-                    print(f"💀 Block {tasks[0][2]} (State {tasks[0][0]}) was killed. Progress for finished panchayats was saved.")
-                    # This is a very slow block (a struggler) that takes more than 10 minutes. We skip it for the batch as it may be better to scrape it in later batches.
-                except Exception as e:
-                    print(f"❌ Task Error: {e}")
-
-    # Cleanup when it's all finished
-    write_queue.put(("STOP", None))
-    writer_thread.join()
-    print("✅ All Done.")
+                while True:
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        break # Batch finished
+                    except TimeoutError:
+                        print(f"💀 A block was killed. Progress for finished panchayats was saved.")
+                        # This is a very slow block (a struggler) that takes more than 10 minutes. We skip it for the batch as it may be better to scrape it in later batches.
+                    except Exception as e:
+                        print(f"❌ Task Error: {e}")
+    except KeyboardInterrupt:
+        print("\n🛑 Shutdown signal received! Cleaning up...")
+    finally:
+        # This block runs whether the script finishes or you press Ctrl+C
+        print("📨 Sending stop signal to DB writer...")
+        write_queue.put(("STOP", None))
+        writer_thread.join(timeout=5) # Wait for it to finish its last write
+        print("✅  Exit complete.")     
     
 if __name__ == "__main__":
     main()
