@@ -432,8 +432,8 @@ def main():
             # 4. We pass the shared queue to every new process via 'initializer'
             with ProcessPool(max_workers=NUM_SCRAPER_PROCESSES, initializer=init_worker_process, initargs=(write_queue, shared_scheme_cache, failure_counter)) as pool:
             
-                # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 10 minutes because some blocks are quite large but we don't wanna take too long. We can always scrape the left out blocks later because we record the progress at the panchayat level
-                future = pool.map(run_scraper_task, tasks, timeout=3600)
+                # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 30 minutes because some blocks have really large panchayats (check out block_val 1336), but we don't wanna take too long either. We can always scrape the left out blocks later because we record the progress at the panchayat level.
+                future = pool.map(run_scraper_task, tasks, timeout=1800)
             
                 iterator = future.result()
             
