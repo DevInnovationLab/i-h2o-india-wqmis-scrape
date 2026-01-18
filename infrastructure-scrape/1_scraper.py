@@ -12,9 +12,10 @@ from pebble import ProcessPool
 URL = "https://ejalshakti.gov.in/JJM/JJMReports/profiles/rpt_VillageProfile.aspx"
 DOMAIN = "https://ejalshakti.gov.in/JJM/"
 DB_NAME = "jjm_parallel_data.db"
-NUM_SCRAPER_PROCESSES = 15 # Adjust this amount if you want to increase/decrease the workers/scrapers
-BATCH_SIZE = 100 # The scrapers work in batch to organize what the workers can work on. Keep this high so that the workers could keep working because sometimes there's a "struggler" worker.
-COOLDOWN_PERIOD = 300 # Adjust this amount if you want to edit the cooldown. Five minutes seem to be sufficient to circumvent a soft IP Block.
+NUM_SCRAPER_PROCESSES = 100 # Adjust this amount if you want to increase/decrease the workers/scrapers
+BLOCK_BATCH_SIZE = 300 # The scrapers work in batch to organize what the workers can work on. Keep this high so that the workers could keep working because sometimes there's a "struggler" worker.
+WORK_DURATION = 1200 # Since we scrape really fast, we need to set a limit duration to the period where we scrape. We will then have a cooldown before scraping again.
+COOLDOWN_PERIOD = 300 # Adjust this amount if you want to edit the cooldown. 2-3 minutes seem to be sufficient to circumvent a soft IP Block.
 
 # --- PARSING HELPERS ---
 # These are just functions that we use to grab the texts and format them
@@ -256,28 +257,19 @@ class ScraperWorker:
                 
                 # Success! Checkpoint this Panchayat
                 write_queue.put(("MARK_DONE", (block_val, pan_val, pan_name)))
-            
+            print(f"🧱 Block {block_val} scraped!")
+
         except Exception as e:
             print(f"❌ Error on Block {block_val}: {e}")
-            if "Read timed out" in str(e):
-                with failure_counter.get_lock():
-                    failure_counter.value += 1
-                    current_fails = failure_counter.value
-
-                if current_fails >= 3:
-                # Every worker that sees current_fails >= 3 will sleep
-                    print(f"🛑 Failures: {current_fails}. Sleeping for a while...")
-                    time.sleep(COOLDOWN_PERIOD) 
-        
-                    with failure_counter.get_lock():
-                        failure_counter.value = 0
 
 # --- DB WRITER ---
 # This function runs as a background "Listener" thread in Python. 
 # Its job is to protect the database from being overwhelmed by multiple workers trying to write at the exact same time.
 def db_writer_listener():
+
     # Establish a single, stable connection to the database file.
     conn = sqlite3.connect(DB_NAME, timeout=30)
+
     # Enable WAL mode for better performance during high-speed parallel scraping.
     conn.execute("PRAGMA journal_mode=WAL") 
     c = conn.cursor()
@@ -382,13 +374,11 @@ def init_db():
 # --- MULTIPROCESSING HELPERS ---
 
 # Function to start a worker
-def init_worker_process(q, cache, f_count):
+def init_worker_process(q, cache):
     global write_queue
     write_queue = q
     global shared_scheme_cache
     shared_scheme_cache = cache
-    global failure_counter
-    failure_counter = f_count
 
 # A wrapper function to run the worker class inside a process
 def run_scraper_task(task):
@@ -409,18 +399,28 @@ def main():
     # 1. Setup Multiprocessing Manager
     manager = multiprocessing.Manager()
     write_queue = manager.Queue()
-    shared_scheme_cache = manager.list(existing_schemes) # Shared list
-    failure_counter = manager.Value('i', 0) # Failure counter for sleeping if we get too many failures
+    shared_scheme_cache = manager.list(existing_schemes) # Shared scheme list
 
     # 2. Start DB Writer (Runs in a Thread in the Main Process)
     writer_thread = threading.Thread(target=db_writer_listener, daemon=True)
     writer_thread.start()
 
+    # Start timer (so we don't scrape for too long and can sleep)
+    last_rest_time = time.time()
     try:
         while True:
+
+            elapsed_time = time.time() - last_rest_time
+            
+            if elapsed_time > WORK_DURATION:
+                print(f"\n⏰ Time limit reached ({int(elapsed_time)}s run)! Resting for {COOLDOWN_PERIOD}s...")
+                time.sleep(COOLDOWN_PERIOD)
+
+                last_rest_time = time.time()
+
             # 3. Grab Batch
             conn = sqlite3.connect(DB_NAME, timeout=30)
-            tasks = conn.execute(f"SELECT DISTINCT state_val, dist_val, block_val FROM queue WHERE status = 'PENDING' LIMIT {BATCH_SIZE}").fetchall()
+            tasks = conn.execute(f"SELECT DISTINCT state_val, dist_val, block_val FROM queue WHERE status = 'PENDING' LIMIT {BLOCK_BATCH_SIZE}").fetchall()
             conn.close()
 
             if not tasks:
@@ -428,16 +428,21 @@ def main():
                 time.sleep(30); continue
 
             print(f"⚡️ Batch Start: Dispatching {len(tasks)} tasks...")
-
-            # 4. We pass the shared queue to every new process via 'initializer'
-            with ProcessPool(max_workers=NUM_SCRAPER_PROCESSES, initializer=init_worker_process, initargs=(write_queue, shared_scheme_cache, failure_counter)) as pool:
             
-                # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 30 minutes because some blocks have really large panchayats (check out block_val 1336), but we don't wanna take too long either. We can always scrape the left out blocks later because we record the progress at the panchayat level.
-                future = pool.map(run_scraper_task, tasks, timeout=1800)
+            # 5. We pass the shared queue to every new process via 'initializer'
+            with ProcessPool(max_workers=NUM_SCRAPER_PROCESSES, initializer=init_worker_process, initargs=(write_queue, shared_scheme_cache)) as pool:
+            
+                # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 10 minutes here so that our timer is guaranteed to be checked periodically. This will naturally skip some panchayats with super high villages, which could be checked later.
+                future = pool.map(run_scraper_task, tasks, timeout=600)
             
                 iterator = future.result()
-            
                 while True:
+                    if time.time() - last_rest_time > WORK_DURATION:
+                        print(f"⚠️ Timer expired mid-batch! Stopping batch...")
+                        future.cancel()
+                        pool.stop()
+                        pool.join()
+                        break
                     try:
                         next(iterator)
                     except StopIteration:
@@ -447,6 +452,7 @@ def main():
                         # This is a very slow block (a struggler) that takes more than 10 minutes. We skip it for the batch as it may be better to scrape it in later batches.
                     except Exception as e:
                         print(f"❌ Task Error: {e}")
+
     except KeyboardInterrupt:
         print("\n🛑 Shutdown signal received! Cleaning up...")
     finally:
@@ -454,7 +460,7 @@ def main():
         print("📨 Sending stop signal to DB writer...")
         write_queue.put(("STOP", None))
         writer_thread.join(timeout=5) # Wait for it to finish its last write
-        print("✅  Exit complete.")     
+        print("✅ Exit complete.")     
     
 if __name__ == "__main__":
     main()
