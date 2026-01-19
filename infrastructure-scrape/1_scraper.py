@@ -3,9 +3,10 @@ from bs4 import BeautifulSoup
 import re
 import sqlite3
 import time
+import random
 import threading
 import multiprocessing
-from concurrent.futures import TimeoutError
+from concurrent.futures import TimeoutError, as_completed
 from pebble import ProcessPool
 
 # --- CONFIG ---
@@ -13,9 +14,9 @@ URL = "https://ejalshakti.gov.in/JJM/JJMReports/profiles/rpt_VillageProfile.aspx
 DOMAIN = "https://ejalshakti.gov.in/JJM/"
 DB_NAME = "jjm_parallel_data.db"
 NUM_SCRAPER_PROCESSES = 100 # Adjust this amount if you want to increase/decrease the workers/scrapers
-BLOCK_BATCH_SIZE = 300 # The scrapers work in batch to organize what the workers can work on. Keep this high so that the workers could keep working because sometimes there's a "struggler" worker.
+BLOCK_BATCH_SIZE = 300 # The scrapers work in batch to organize what the workers can work on. Keep this high so that the workers could keep working as sometimes there's a "struggler" worker.
 WORK_DURATION = 1200 # Since we scrape really fast, we need to set a limit duration to the period where we scrape. We will then have a cooldown before scraping again.
-COOLDOWN_PERIOD = 300 # Adjust this amount if you want to edit the cooldown. 2-3 minutes seem to be sufficient to circumvent a soft IP Block.
+
 
 # --- PARSING HELPERS ---
 # These are just functions that we use to grab the texts and format them
@@ -257,7 +258,6 @@ class ScraperWorker:
                 
                 # Success! Checkpoint this Panchayat
                 write_queue.put(("MARK_DONE", (block_val, pan_val, pan_name)))
-            print(f"🧱 Block {block_val} scraped!")
 
         except Exception as e:
             print(f"❌ Error on Block {block_val}: {e}")
@@ -319,7 +319,7 @@ def db_writer_listener():
                 conn.commit()
                 tasks_done += 1
                 percent = (tasks_done / total_tasks) * 100 if total_tasks > 0 else 0
-                print(f"✅ [{tasks_done:,} done out of {total_tasks:,} panchayats | {percent:.2f}%] Finished: {pan_name}")
+                print(f"✅ [{tasks_done:,} scraped out of {total_tasks:,} panchayats | {percent:.2f}%] Finished: {pan_name}")
 
         except Exception as e:
             print(f"❌ DB Writer Error: {e}")
@@ -383,7 +383,8 @@ def init_worker_process(q, cache):
 # A wrapper function to run the worker class inside a process
 def run_scraper_task(task):
     worker = ScraperWorker(shared_scheme_cache)
-    return worker.process_block(task)
+    worker.process_block(task)
+    return task[2] # This is the block_val
 
 # --- Main function ---
 def main():
@@ -411,9 +412,17 @@ def main():
         while True:
 
             elapsed_time = time.time() - last_rest_time
-            
             if elapsed_time > WORK_DURATION:
-                print(f"\n⏰ Time limit reached ({int(elapsed_time)}s run)! Resting for {COOLDOWN_PERIOD}s...")
+
+                print(f"🗄️ Backlog cleared! Creating a backup for {DB_NAME}")
+                main = sqlite3.connect(DB_NAME)
+                backup = sqlite3.connect("jjm_parallel_data_backup.db")
+                sqlite3.connect(DB_NAME).backup(backup)
+                backup.close()
+                main.close()
+                
+                COOLDOWN_PERIOD = random.uniform(120, 180) # Adjust this amount if you want to edit the random cooldown. 2-3 minutes seem to be sufficient to circumvent a soft IP Block, not to mention that we also have backlog clearing (which adds more time where we do not connect to the server).
+                print(f"⏰ Backup created! Resting for {int(COOLDOWN_PERIOD)}s...")
                 time.sleep(COOLDOWN_PERIOD)
 
                 last_rest_time = time.time()
@@ -425,30 +434,32 @@ def main():
 
             if not tasks:
                 print("💤 No pending tasks, closing in 30 seconds...")
-                time.sleep(30); continue
+                time.sleep(30)
+                continue
 
-            print(f"⚡️ Batch Start: Dispatching {len(tasks)} tasks...")
+            print(f"⚡️ Batch Start: Dispatching {len(tasks)} blocks...")
             
             # 5. We pass the shared queue to every new process via 'initializer'
             with ProcessPool(max_workers=NUM_SCRAPER_PROCESSES, initializer=init_worker_process, initargs=(write_queue, shared_scheme_cache)) as pool:
             
                 # EDIT THE MAXIMUM TASK SPEED HERE. We set it to 10 minutes here so that our timer is guaranteed to be checked periodically. This will naturally skip some panchayats with super high villages, which could be checked later.
-                future = pool.map(run_scraper_task, tasks, timeout=600)
+                futures = [pool.schedule(run_scraper_task, args=(task,), timeout=600) for task in tasks]
             
-                iterator = future.result()
-                while True:
+                for future in as_completed(futures):
                     if time.time() - last_rest_time > WORK_DURATION:
-                        print(f"⚠️ Timer expired mid-batch! Stopping batch...")
+                        print(f"⚠️ Timer expired mid-batch ({int(time.time() - last_rest_time)}s elapsed)! Stopping batch...")
                         future.cancel()
                         pool.stop()
                         pool.join()
+                        print(f"⏳ Waiting for DB Writer to clear backlog ({write_queue.qsize():,} items approx). This will take a while...")
+                        while not write_queue.empty():
+                            time.sleep(1)
                         break
                     try:
-                        next(iterator)
-                    except StopIteration:
-                        break # Batch finished
+                        block_val = future.result()
+                        print(f"🧱 Block {block_val} finished | ⏰ {int(time.time() - last_rest_time)}s elapsed")
                     except TimeoutError:
-                        print(f"💀 A block was killed. Progress for finished panchayats was saved.")
+                        print(f"💀 A block was killed. Progress for finished panchayats was saved | ⏰ {int(time.time() - last_rest_time)}s elapsed")
                         # This is a very slow block (a struggler) that takes more than 10 minutes. We skip it for the batch as it may be better to scrape it in later batches.
                     except Exception as e:
                         print(f"❌ Task Error: {e}")
